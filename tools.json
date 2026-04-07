@@ -1,0 +1,297 @@
+{
+  "_comment": "Bug Bounty Toolkit - Tool Configuration for Arch Linux",
+  "_version": "1.0.0",
+  "_last_updated": "2025-06",
+
+  "pacman_packages": [
+    {
+      "name": "go",
+      "package": "go",
+      "purpose": "Go language runtime (required for many tools)"
+    },
+    {
+      "name": "python",
+      "package": "python",
+      "purpose": "Python 3 runtime"
+    },
+    {
+      "name": "python-pipx",
+      "package": "python-pipx",
+      "purpose": "Isolated Python tool installer"
+    },
+    {
+      "name": "git",
+      "package": "git",
+      "purpose": "Version control"
+    },
+    {
+      "name": "curl",
+      "package": "curl",
+      "purpose": "HTTP client / download utility"
+    },
+    {
+      "name": "wget",
+      "package": "wget",
+      "purpose": "File download utility"
+    },
+    {
+      "name": "jq",
+      "package": "jq",
+      "purpose": "JSON processor (used by all custom scripts)"
+    },
+    {
+      "name": "nmap",
+      "package": "nmap",
+      "purpose": "Port scanner / service detection"
+    },
+    {
+      "name": "masscan",
+      "package": "masscan",
+      "purpose": "High-speed port scanner"
+    },
+    {
+      "name": "ffuf",
+      "package": "ffuf",
+      "purpose": "Fast web fuzzer"
+    },
+    {
+      "name": "sqlmap",
+      "package": "sqlmap",
+      "purpose": "Automated SQL injection tester"
+    },
+    {
+      "name": "nikto",
+      "package": "nikto",
+      "purpose": "Web server scanner"
+    },
+    {
+      "name": "chromium",
+      "package": "chromium",
+      "purpose": "Headless browser (used by gowitness/aquatone)"
+    },
+    {
+      "name": "whatweb",
+      "package": "whatweb",
+      "purpose": "Web technology fingerprinter"
+    },
+    {
+      "name": "dirb",
+      "package": "dirb",
+      "purpose": "Web content scanner"
+    },
+    {
+      "name": "dnsutils",
+      "package": "bind",
+      "purpose": "DNS utilities (dig, nslookup)"
+    },
+    {
+      "name": "whois",
+      "package": "whois",
+      "purpose": "WHOIS lookup"
+    },
+    {
+      "name": "traceroute",
+      "package": "traceroute",
+      "purpose": "Network path tracing"
+    },
+    {
+      "name": "unzip",
+      "package": "unzip",
+      "purpose": "Archive extraction"
+    },
+    {
+      "name": "parallel",
+      "package": "parallel",
+      "purpose": "GNU parallel execution (used by bb-scan)"
+    }
+  ],
+
+  "aur_packages": [
+    {
+      "name": "gobuster",
+      "package": "gobuster",
+      "purpose": "Directory/DNS/vhost brute-forcer"
+    },
+    {
+      "name": "amass",
+      "package": "amass",
+      "purpose": "In-depth DNS enumeration and network mapping"
+    },
+    {
+      "name": "gowitness",
+      "package": "gowitness",
+      "purpose": "Web screenshot utility using Chrome"
+    },
+    {
+      "name": "gau",
+      "package": "gau-bin",
+      "purpose": "Fetch known URLs from AlienVault, Wayback, Common Crawl"
+    },
+    {
+      "name": "anew",
+      "package": "anew-bin",
+      "purpose": "Append lines to files, skipping duplicates"
+    }
+  ],
+
+  "go_tools": [
+    {
+      "name": "subfinder",
+      "install": "go install -v github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest",
+      "purpose": "Passive subdomain discovery"
+    },
+    {
+      "name": "httpx",
+      "install": "go install -v github.com/projectdiscovery/httpx/cmd/httpx@latest",
+      "purpose": "Fast HTTP probing and technology detection"
+    },
+    {
+      "name": "nuclei",
+      "install": "go install -v github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest",
+      "purpose": "Template-based vulnerability scanner"
+    },
+    {
+      "name": "katana",
+      "install": "go install -v github.com/projectdiscovery/katana/cmd/katana@latest",
+      "purpose": "Next-gen crawling and spidering framework"
+    },
+    {
+      "name": "dnsx",
+      "install": "go install -v github.com/projectdiscovery/dnsx/cmd/dnsx@latest",
+      "purpose": "Fast DNS toolkit"
+    },
+    {
+      "name": "naabu",
+      "install": "go install -v github.com/projectdiscovery/naabu/v2/cmd/naabu@latest",
+      "purpose": "Fast port scanning"
+    },
+    {
+      "name": "pdtm",
+      "install": "go install -v github.com/projectdiscovery/pdtm/cmd/pdtm@latest",
+      "purpose": "ProjectDiscovery tool manager"
+    },
+    {
+      "name": "interactsh-client",
+      "install": "go install -v github.com/projectdiscovery/interactsh/cmd/interactsh-client@latest",
+      "purpose": "OOB interaction server client (SSRF, blind XSS, etc.)"
+    },
+    {
+      "name": "notify",
+      "install": "go install -v github.com/projectdiscovery/notify/cmd/notify@latest",
+      "purpose": "Send scan results to Slack/Discord/Telegram"
+    },
+    {
+      "name": "chaos-client",
+      "install": "go install -v github.com/projectdiscovery/chaos-client/cmd/chaos@latest",
+      "purpose": "ProjectDiscovery chaos dataset client"
+    },
+    {
+      "name": "hakrawler",
+      "install": "go install -v github.com/hakluke/hakrawler@latest",
+      "purpose": "Simple, fast web crawler"
+    },
+    {
+      "name": "waybackurls",
+      "install": "go install -v github.com/tomnomnom/waybackurls@latest",
+      "purpose": "Fetch URLs from the Wayback Machine"
+    },
+    {
+      "name": "qsreplace",
+      "install": "go install -v github.com/tomnomnom/qsreplace@latest",
+      "purpose": "Replace query string values (used in IDOR/injection testing)"
+    },
+    {
+      "name": "gf",
+      "install": "go install -v github.com/tomnomnom/gf@latest",
+      "purpose": "Wrapper for grep with bug bounty patterns"
+    },
+    {
+      "name": "assetfinder",
+      "install": "go install -v github.com/tomnomnom/assetfinder@latest",
+      "purpose": "Find related domains and subdomains"
+    },
+    {
+      "name": "anew",
+      "install": "go install -v github.com/tomnomnom/anew@latest",
+      "purpose": "Append unique lines to files"
+    },
+    {
+      "name": "unfurl",
+      "install": "go install -v github.com/tomnomnom/unfurl@latest",
+      "purpose": "Pull out bits of URLs"
+    },
+    {
+      "name": "dalfox",
+      "install": "go install -v github.com/hahwul/dalfox/v2@latest",
+      "purpose": "Fast parameter analysis and XSS scanner"
+    },
+    {
+      "name": "shuffledns",
+      "install": "go install -v github.com/projectdiscovery/shuffledns/cmd/shuffledns@latest",
+      "purpose": "Wrapper around massdns with wildcard filtering"
+    },
+    {
+      "name": "mapcidr",
+      "install": "go install -v github.com/projectdiscovery/mapcidr/cmd/mapcidr@latest",
+      "purpose": "CIDR manipulation utility"
+    },
+    {
+      "name": "asnmap",
+      "install": "go install -v github.com/projectdiscovery/asnmap/cmd/asnmap@latest",
+      "purpose": "ASN-to-CIDR and IP-to-ASN mapping"
+    },
+    {
+      "name": "tlsx",
+      "install": "go install -v github.com/projectdiscovery/tlsx/cmd/tlsx@latest",
+      "purpose": "TLS data collection and analysis"
+    },
+    {
+      "name": "cdncheck",
+      "install": "go install -v github.com/projectdiscovery/cdncheck/cmd/cdncheck@latest",
+      "purpose": "Identify CDN/WAF/cloud providers"
+    },
+    {
+      "name": "gotator",
+      "install": "go install -v github.com/Josue87/gotator@latest",
+      "purpose": "Subdomain permutation generator"
+    },
+    {
+      "name": "github-subdomains",
+      "install": "go install -v github.com/gwen001/github-subdomains@latest",
+      "purpose": "Find subdomains on GitHub"
+    }
+  ],
+
+  "pipx_tools": [
+    {
+      "name": "arjun",
+      "package": "arjun",
+      "purpose": "HTTP parameter discovery"
+    },
+    {
+      "name": "uro",
+      "package": "uro",
+      "purpose": "Deduplicate URL lists intelligently"
+    },
+    {
+      "name": "trufflehog",
+      "package": "trufflehog",
+      "purpose": "Secrets scanner in git repos"
+    }
+  ],
+
+  "wordlists": [
+    {
+      "name": "SecLists",
+      "repo": "https://github.com/danielmiessler/SecLists",
+      "install_path": "~/wordlists/SecLists",
+      "purpose": "The definitive security testing wordlist collection"
+    },
+    {
+      "name": "OneListForAll",
+      "repo": "https://github.com/six2dez/OneListForAllMicro",
+      "install_path": "~/wordlists/OneListForAll",
+      "purpose": "All-in-one wordlist for web fuzzing"
+    }
+  ]
+}

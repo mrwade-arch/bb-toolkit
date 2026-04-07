@@ -1,0 +1,558 @@
+#!/usr/bin/env bash
+# =============================================================================
+# bb-recon — Full Bug Bounty Recon Pipeline
+# Version: 1.0.0
+# =============================================================================
+# LEGAL DISCLAIMER:
+#   This tool is intended ONLY for use on targets you have explicit, written
+#   authorization to test. Unauthorized scanning is illegal under the Computer
+#   Fraud and Abuse Act (US), the Computer Misuse Act (UK), and equivalent
+#   laws worldwide. Running this against targets without permission may result
+#   in criminal prosecution. The author assumes NO liability for misuse.
+#   Always verify scope. Always test responsibly.
+# =============================================================================
+
+set -euo pipefail
+
+# ─── Colors ───────────────────────────────────────────────────────────────────
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+MAGENTA='\033[0;35m'
+BOLD='\033[1m'
+NC='\033[0m'
+
+# ─── Config ───────────────────────────────────────────────────────────────────
+BB_HOME="${BB_HOME:-$HOME/bugbounty}"
+THREADS="${BB_RECON_THREADS:-50}"
+RATE_LIMIT="${BB_RECON_RATE:-150}"       # httpx requests/sec
+NUCLEI_RATE="${BB_NUCLEI_RATE:-50}"      # nuclei requests/sec
+RESOLVERS_FILE="${BB_RESOLVERS:-}"        # optional custom resolvers file
+NUCLEI_SEVERITY="${BB_NUCLEI_SEVERITY:-critical,high,medium}"
+SCREENSHOTS="${BB_SCREENSHOTS:-true}"
+PASSIVE_ONLY="${BB_PASSIVE:-false}"
+
+TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
+
+# ─── Helpers ──────────────────────────────────────────────────────────────────
+banner() {
+  echo -e "${MAGENTA}"
+  cat <<'EOF'
+  ██████╗ ██████╗       ██████╗ ███████╗ ██████╗ ██████╗ ███╗   ██╗
+  ██╔══██╗██╔══██╗      ██╔══██╗██╔════╝██╔════╝██╔═══██╗████╗  ██║
+  ██████╔╝██████╔╝█████╗██████╔╝█████╗  ██║     ██║   ██║██╔██╗ ██║
+  ██╔══██╗██╔══██╗╚════╝██╔══██╗██╔══╝  ██║     ██║   ██║██║╚██╗██║
+  ██████╔╝██████╔╝      ██║  ██║███████╗╚██████╗╚██████╔╝██║ ╚████║
+  ╚═════╝ ╚═════╝       ╚═╝  ╚═╝╚══════╝ ╚═════╝ ╚═════╝ ╚═╝  ╚═══╝
+EOF
+  echo -e "${NC}"
+  echo -e "${BOLD}  Full Bug Bounty Recon Pipeline | v1.0.0${NC}"
+  echo -e "${RED}  ⚠  Authorized targets only. Test responsibly.${NC}"
+  echo ""
+}
+
+info()    { echo -e "${CYAN}[*]${NC} $*"; }
+success() { echo -e "${GREEN}[✓]${NC} $*"; }
+warn()    { echo -e "${YELLOW}[!]${NC} $*"; }
+error()   { echo -e "${RED}[✗]${NC} $*" >&2; }
+step()    { echo -e "\n${BLUE}${BOLD}[STEP]${NC} $*"; echo -e "${BLUE}$(printf '%.0s─' {1..60})${NC}"; }
+
+usage() {
+  cat <<EOF
+${BOLD}USAGE${NC}
+  bb-recon [OPTIONS] <domain>
+
+${BOLD}ARGUMENTS${NC}
+  <domain>           Target domain (e.g. example.com)
+
+${BOLD}OPTIONS${NC}
+  -t, --threads N    Number of threads (default: $THREADS)
+  -r, --rate N       HTTP rate limit req/sec (default: $RATE_LIMIT)
+  -s, --severity S   Nuclei severity filter (default: $NUCLEI_SEVERITY)
+  -o, --output DIR   Output directory (default: $BB_HOME/<domain>/)
+  -p, --passive      Passive recon only (no active scanning)
+  --no-screenshots   Skip screenshot phase
+  --resolvers FILE   Custom DNS resolvers file
+  -h, --help         Show this help
+
+${BOLD}ENVIRONMENT VARIABLES${NC}
+  BB_HOME            Base directory (default: ~/bugbounty)
+  BB_RECON_THREADS   Thread count
+  BB_RECON_RATE      HTTP rate limit
+  BB_NUCLEI_RATE     Nuclei rate limit
+  BB_NUCLEI_SEVERITY Severity filter
+  BB_SCREENSHOTS     Enable screenshots (true/false)
+
+${BOLD}EXAMPLES${NC}
+  bb-recon example.com
+  bb-recon -t 100 -s critical,high example.com
+  bb-recon --passive example.com
+
+${BOLD}OUTPUT STRUCTURE${NC}
+  ~/bugbounty/<domain>/
+  ├── subdomains/    (passive + active enumeration results)
+  ├── hosts/         (live host probing results)
+  ├── urls/          (crawled + wayback URLs)
+  ├── vulns/         (nuclei scan results)
+  ├── screenshots/   (gowitness output)
+  └── reports/       (summary reports)
+
+${RED}${BOLD}LEGAL: Only run against targets you are authorized to test.${NC}
+EOF
+  exit 0
+}
+
+check_tool() {
+  if ! command -v "$1" &>/dev/null; then
+    warn "Tool '$1' not found — skipping that phase."
+    return 1
+  fi
+  return 0
+}
+
+require_tool() {
+  if ! command -v "$1" &>/dev/null; then
+    error "Required tool '$1' not found. Run install.sh to set up the toolkit."
+    exit 1
+  fi
+}
+
+countdown() {
+  local msg="$1"
+  local secs="${2:-5}"
+  echo -ne "${YELLOW}${msg} (Ctrl+C to abort) ${NC}"
+  for ((i=secs; i>0; i--)); do
+    echo -ne "${YELLOW}${i}...${NC}"
+    sleep 1
+  done
+  echo ""
+}
+
+# ─── Argument Parsing ─────────────────────────────────────────────────────────
+DOMAIN=""
+OUTPUT_DIR=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -h|--help)         usage ;;
+    -t|--threads)      THREADS="$2"; shift 2 ;;
+    -r|--rate)         RATE_LIMIT="$2"; shift 2 ;;
+    -s|--severity)     NUCLEI_SEVERITY="$2"; shift 2 ;;
+    -o|--output)       OUTPUT_DIR="$2"; shift 2 ;;
+    -p|--passive)      PASSIVE_ONLY="true"; shift ;;
+    --no-screenshots)  SCREENSHOTS="false"; shift ;;
+    --resolvers)       RESOLVERS_FILE="$2"; shift 2 ;;
+    -*)                error "Unknown option: $1"; usage ;;
+    *)
+      if [[ -z "$DOMAIN" ]]; then
+        DOMAIN="$1"
+        shift
+      else
+        error "Unexpected argument: $1"
+        usage
+      fi
+      ;;
+  esac
+done
+
+# ─── Pre-flight ───────────────────────────────────────────────────────────────
+banner
+
+if [[ -z "$DOMAIN" ]]; then
+  error "No domain specified."
+  usage
+fi
+
+# Sanitize domain
+DOMAIN="${DOMAIN,,}"
+DOMAIN="${DOMAIN#https://}"
+DOMAIN="${DOMAIN#http://}"
+DOMAIN="${DOMAIN%%/*}"
+
+if [[ -z "$OUTPUT_DIR" ]]; then
+  OUTPUT_DIR="${BB_HOME}/${DOMAIN}/${TIMESTAMP}"
+fi
+
+require_tool subfinder
+require_tool httpx
+
+echo -e "${RED}${BOLD}"
+echo "  ╔═══════════════════════════════════════════════════╗"
+echo "  ║            ⚠  LEGAL WARNING  ⚠                  ║"
+echo "  ║  Only run against targets you have explicit,      ║"
+echo "  ║  written authorization to test.                   ║"
+echo "  ║  Unauthorized testing is a criminal offense.      ║"
+echo "  ╚═══════════════════════════════════════════════════╝"
+echo -e "${NC}"
+
+countdown "Starting recon against: ${BOLD}${DOMAIN}${NC}" 5
+
+# ─── Directory Setup ──────────────────────────────────────────────────────────
+mkdir -p \
+  "${OUTPUT_DIR}/subdomains" \
+  "${OUTPUT_DIR}/hosts" \
+  "${OUTPUT_DIR}/urls" \
+  "${OUTPUT_DIR}/vulns" \
+  "${OUTPUT_DIR}/screenshots" \
+  "${OUTPUT_DIR}/reports" \
+  "${OUTPUT_DIR}/raw"
+
+LOG_FILE="${OUTPUT_DIR}/reports/recon_${TIMESTAMP}.log"
+exec > >(tee -a "$LOG_FILE") 2>&1
+
+info "Target:      ${BOLD}${DOMAIN}${NC}"
+info "Output:      ${OUTPUT_DIR}"
+info "Threads:     ${THREADS}"
+info "Rate limit:  ${RATE_LIMIT} req/s"
+info "Severity:    ${NUCLEI_SEVERITY}"
+info "Passive:     ${PASSIVE_ONLY}"
+info "Screenshots: ${SCREENSHOTS}"
+info "Started:     $(date)"
+echo ""
+
+# ─── STEP 1: Subdomain Enumeration ───────────────────────────────────────────
+step "1/7 — Subdomain Enumeration"
+
+SUB_ALL="${OUTPUT_DIR}/subdomains/all.txt"
+SUB_PASSIVE="${OUTPUT_DIR}/subdomains/passive.txt"
+
+info "Running subfinder (passive)..."
+subfinder -d "$DOMAIN" \
+  -all \
+  -t "$THREADS" \
+  -silent \
+  -o "${SUB_PASSIVE}" 2>/dev/null || true
+
+SUB_COUNT=$(wc -l < "${SUB_PASSIVE}" 2>/dev/null || echo 0)
+success "subfinder found ${SUB_COUNT} subdomains"
+
+# assetfinder (if available)
+if check_tool assetfinder; then
+  info "Running assetfinder..."
+  assetfinder --subs-only "$DOMAIN" 2>/dev/null \
+    | anew "${SUB_PASSIVE}" > /dev/null || true
+fi
+
+# github-subdomains (if available + token set)
+if check_tool github-subdomains && [[ -n "${GITHUB_TOKEN:-}" ]]; then
+  info "Running github-subdomains..."
+  github-subdomains -d "$DOMAIN" -t "$GITHUB_TOKEN" -o /tmp/gh_subs_$$ 2>/dev/null || true
+  [[ -f /tmp/gh_subs_$$ ]] && cat /tmp/gh_subs_$$ | anew "${SUB_PASSIVE}" > /dev/null
+  rm -f /tmp/gh_subs_$$
+fi
+
+# chaos (if available + token set)
+if check_tool chaos && [[ -n "${CHAOS_KEY:-}" ]]; then
+  info "Running chaos..."
+  chaos -d "$DOMAIN" -key "$CHAOS_KEY" -silent 2>/dev/null \
+    | anew "${SUB_PASSIVE}" > /dev/null || true
+fi
+
+# amass passive
+if [[ "$PASSIVE_ONLY" == "true" ]] && check_tool amass; then
+  info "Running amass (passive)..."
+  amass enum -passive -d "$DOMAIN" -timeout 10 -o /tmp/amass_$$ 2>/dev/null || true
+  [[ -f /tmp/amass_$$ ]] && cat /tmp/amass_$$ | anew "${SUB_PASSIVE}" > /dev/null
+  rm -f /tmp/amass_$$
+fi
+
+# DNS brute force (active, skipped in passive mode)
+if [[ "$PASSIVE_ONLY" != "true" ]] && check_tool shuffledns; then
+  WORDLIST=""
+  for wl in \
+    "$HOME/wordlists/SecLists/Discovery/DNS/subdomains-top1million-20000.txt" \
+    "$HOME/wordlists/SecLists/Discovery/DNS/n0kovo_subdomains.txt" \
+    "/usr/share/wordlists/dirb/common.txt"; do
+    if [[ -f "$wl" ]]; then
+      WORDLIST="$wl"
+      break
+    fi
+  done
+
+  if [[ -n "$WORDLIST" ]]; then
+    info "Running shuffledns brute force with $(wc -l < "$WORDLIST") words..."
+    RESOLVER_ARGS=""
+    [[ -n "$RESOLVERS_FILE" ]] && RESOLVER_ARGS="-r $RESOLVERS_FILE"
+    shuffledns -d "$DOMAIN" -w "$WORDLIST" $RESOLVER_ARGS \
+      -t "$THREADS" -silent -o /tmp/shuffle_$$ 2>/dev/null || true
+    [[ -f /tmp/shuffle_$$ ]] && cat /tmp/shuffle_$$ | anew "${SUB_PASSIVE}" > /dev/null
+    rm -f /tmp/shuffle_$$
+  fi
+fi
+
+# Deduplicate and sort
+sort -u "${SUB_PASSIVE}" > "${SUB_ALL}" 2>/dev/null || touch "${SUB_ALL}"
+TOTAL_SUBS=$(wc -l < "${SUB_ALL}")
+success "Total unique subdomains: ${BOLD}${TOTAL_SUBS}${NC}"
+
+# ─── STEP 2: DNS Resolution + Live Host Check ─────────────────────────────────
+step "2/7 — DNS Resolution & Live Host Detection"
+
+LIVE_HOSTS="${OUTPUT_DIR}/hosts/live.txt"
+LIVE_JSON="${OUTPUT_DIR}/hosts/live.json"
+DNSX_RESULTS="${OUTPUT_DIR}/subdomains/resolved.txt"
+
+if check_tool dnsx; then
+  info "Resolving subdomains with dnsx..."
+  DNSX_ARGS="-t $THREADS -silent"
+  [[ -n "$RESOLVERS_FILE" ]] && DNSX_ARGS="$DNSX_ARGS -r $RESOLVERS_FILE"
+  cat "${SUB_ALL}" | dnsx $DNSX_ARGS -o "${DNSX_RESULTS}" 2>/dev/null || \
+    cp "${SUB_ALL}" "${DNSX_RESULTS}"
+else
+  cp "${SUB_ALL}" "${DNSX_RESULTS}"
+fi
+
+RESOLVED=$(wc -l < "${DNSX_RESULTS}" 2>/dev/null || echo 0)
+success "Resolved: ${RESOLVED} hosts"
+
+info "Probing live HTTP/HTTPS hosts with httpx..."
+httpx -l "${DNSX_RESULTS}" \
+  -threads "$THREADS" \
+  -rate-limit "$RATE_LIMIT" \
+  -silent \
+  -status-code \
+  -content-length \
+  -title \
+  -tech-detect \
+  -follow-redirects \
+  -json \
+  -o "${LIVE_JSON}" 2>/dev/null || true
+
+# Extract clean URL list
+if [[ -f "${LIVE_JSON}" ]]; then
+  jq -r '.url' "${LIVE_JSON}" 2>/dev/null | sort -u > "${LIVE_HOSTS}" || true
+fi
+
+LIVE_COUNT=$(wc -l < "${LIVE_HOSTS}" 2>/dev/null || echo 0)
+success "Live hosts: ${BOLD}${LIVE_COUNT}${NC}"
+
+# ─── STEP 3: URL Collection ───────────────────────────────────────────────────
+step "3/7 — URL Collection (Wayback + Crawling)"
+
+URLS_ALL="${OUTPUT_DIR}/urls/all.txt"
+URLS_INTERESTING="${OUTPUT_DIR}/urls/interesting.txt"
+
+# Wayback Machine
+if check_tool waybackurls; then
+  info "Fetching Wayback Machine URLs..."
+  echo "$DOMAIN" | waybackurls 2>/dev/null \
+    | sort -u > "${OUTPUT_DIR}/urls/wayback.txt" || true
+  WAYBACK_COUNT=$(wc -l < "${OUTPUT_DIR}/urls/wayback.txt" 2>/dev/null || echo 0)
+  success "Wayback URLs: ${WAYBACK_COUNT}"
+fi
+
+# GAU (Get All URLs)
+if check_tool gau; then
+  info "Running gau (AlienVault + Wayback + CommonCrawl)..."
+  echo "$DOMAIN" | gau --threads "$THREADS" --subs 2>/dev/null \
+    | sort -u > "${OUTPUT_DIR}/urls/gau.txt" || true
+  GAU_COUNT=$(wc -l < "${OUTPUT_DIR}/urls/gau.txt" 2>/dev/null || echo 0)
+  success "GAU URLs: ${GAU_COUNT}"
+fi
+
+# Katana crawl (active)
+if [[ "$PASSIVE_ONLY" != "true" ]] && check_tool katana && [[ $LIVE_COUNT -gt 0 ]]; then
+  info "Crawling live hosts with katana..."
+  katana -list "${LIVE_HOSTS}" \
+    -depth 3 \
+    -jc \
+    -jsl \
+    -kf all \
+    -c "$THREADS" \
+    -rl "$RATE_LIMIT" \
+    -silent \
+    -o "${OUTPUT_DIR}/urls/katana.txt" 2>/dev/null || true
+  KATANA_COUNT=$(wc -l < "${OUTPUT_DIR}/urls/katana.txt" 2>/dev/null || echo 0)
+  success "Katana URLs: ${KATANA_COUNT}"
+fi
+
+# Merge all URLs
+cat "${OUTPUT_DIR}/urls/"*.txt 2>/dev/null | sort -u > "${URLS_ALL}" || touch "${URLS_ALL}"
+TOTAL_URLS=$(wc -l < "${URLS_ALL}")
+success "Total unique URLs: ${BOLD}${TOTAL_URLS}${NC}"
+
+# Filter interesting URLs (parameters, APIs, etc.)
+if check_tool gf; then
+  info "Filtering interesting URLs with gf patterns..."
+  for pattern in xss sqli ssrf redirect lfi rce idor; do
+    gf "$pattern" < "${URLS_ALL}" 2>/dev/null \
+      >> "${URLS_INTERESTING}" || true
+  done
+  sort -u "${URLS_INTERESTING}" -o "${URLS_INTERESTING}" 2>/dev/null || true
+  INTERESTING=$(wc -l < "${URLS_INTERESTING}" 2>/dev/null || echo 0)
+  success "Interesting URLs flagged: ${INTERESTING}"
+fi
+
+# uro deduplication
+if check_tool uro && [[ $TOTAL_URLS -gt 0 ]]; then
+  info "Deduplicating URLs with uro..."
+  uro < "${URLS_ALL}" > "${OUTPUT_DIR}/urls/deduped.txt" 2>/dev/null || true
+fi
+
+# ─── STEP 4: Screenshots ──────────────────────────────────────────────────────
+if [[ "$SCREENSHOTS" == "true" ]] && [[ $LIVE_COUNT -gt 0 ]]; then
+  step "4/7 — Screenshots"
+
+  if check_tool gowitness; then
+    info "Taking screenshots with gowitness..."
+    gowitness file \
+      -f "${LIVE_HOSTS}" \
+      --screenshot-path "${OUTPUT_DIR}/screenshots" \
+      --threads "$THREADS" \
+      --timeout 10 \
+      2>/dev/null || true
+    SHOTS=$(find "${OUTPUT_DIR}/screenshots" -name "*.png" 2>/dev/null | wc -l)
+    success "Screenshots taken: ${SHOTS}"
+  else
+    warn "gowitness not found — skipping screenshots"
+  fi
+else
+  step "4/7 — Screenshots (skipped)"
+  warn "Screenshots skipped (no live hosts or --no-screenshots)"
+fi
+
+# ─── STEP 5: Vulnerability Scanning ──────────────────────────────────────────
+step "5/7 — Nuclei Vulnerability Scanning"
+
+NUCLEI_OUT="${OUTPUT_DIR}/vulns/nuclei.txt"
+NUCLEI_JSON="${OUTPUT_DIR}/vulns/nuclei.json"
+
+if check_tool nuclei && [[ $LIVE_COUNT -gt 0 ]]; then
+  # Update templates silently first
+  info "Updating nuclei templates..."
+  nuclei -update-templates -silent 2>/dev/null || true
+
+  info "Scanning with nuclei (severity: ${NUCLEI_SEVERITY})..."
+  nuclei \
+    -l "${LIVE_HOSTS}" \
+    -severity "${NUCLEI_SEVERITY}" \
+    -rl "${NUCLEI_RATE}" \
+    -c 25 \
+    -timeout 10 \
+    -retries 2 \
+    -silent \
+    -o "${NUCLEI_OUT}" \
+    -jsonl \
+    -output "${NUCLEI_JSON}" \
+    2>/dev/null || true
+
+  FINDINGS=$(wc -l < "${NUCLEI_OUT}" 2>/dev/null || echo 0)
+
+  if [[ $FINDINGS -gt 0 ]]; then
+    success "${BOLD}${RED}Nuclei findings: ${FINDINGS}${NC}"
+    echo ""
+    echo -e "${YELLOW}═══ FINDINGS SUMMARY ════════════════════════════════${NC}"
+    grep -oP '(?<=\[)[^\]]+(?=\])' "${NUCLEI_OUT}" 2>/dev/null | sort | uniq -c | sort -rn || true
+    echo ""
+  else
+    success "Nuclei: No findings (at selected severity)"
+  fi
+else
+  warn "nuclei not found or no live hosts — skipping vulnerability scan"
+fi
+
+# ─── STEP 6: Technology + Header Analysis ─────────────────────────────────────
+step "6/7 — Technology Fingerprinting"
+
+if [[ -f "${LIVE_JSON}" ]]; then
+  info "Generating technology summary from httpx results..."
+  TECH_SUMMARY="${OUTPUT_DIR}/reports/technologies.txt"
+
+  {
+    echo "=== Technology Summary for ${DOMAIN} ==="
+    echo "Generated: $(date)"
+    echo ""
+    echo "--- Web Servers ---"
+    jq -r '.webserver // empty' "${LIVE_JSON}" 2>/dev/null | sort | uniq -c | sort -rn
+    echo ""
+    echo "--- Technologies Detected ---"
+    jq -r '.tech[]? // empty' "${LIVE_JSON}" 2>/dev/null | sort | uniq -c | sort -rn
+    echo ""
+    echo "--- Status Codes ---"
+    jq -r '.status_code // empty' "${LIVE_JSON}" 2>/dev/null | sort | uniq -c | sort -rn
+    echo ""
+    echo "--- Page Titles ---"
+    jq -r 'select(.title != null) | "\(.url) → \(.title)"' "${LIVE_JSON}" 2>/dev/null | head -50
+  } > "${TECH_SUMMARY}" 2>/dev/null || true
+
+  success "Technology report: ${TECH_SUMMARY}"
+fi
+
+# ─── STEP 7: Final Report ─────────────────────────────────────────────────────
+step "7/7 — Generating Summary Report"
+
+FINAL_REPORT="${OUTPUT_DIR}/reports/summary.md"
+
+TOTAL_SUBS=$(wc -l < "${SUB_ALL}" 2>/dev/null || echo 0)
+TOTAL_LIVE=$(wc -l < "${LIVE_HOSTS}" 2>/dev/null || echo 0)
+TOTAL_URLS_FINAL=$(wc -l < "${URLS_ALL}" 2>/dev/null || echo 0)
+TOTAL_VULNS=$(wc -l < "${NUCLEI_OUT}" 2>/dev/null || echo 0)
+TOTAL_SHOTS=$(find "${OUTPUT_DIR}/screenshots" -name "*.png" 2>/dev/null | wc -l)
+
+cat > "${FINAL_REPORT}" <<REPORT
+# Recon Report: ${DOMAIN}
+**Date:** $(date)
+**Duration:** $((SECONDS/60))m $((SECONDS%60))s
+
+## Summary
+
+| Category         | Count |
+|-----------------|-------|
+| Subdomains found | ${TOTAL_SUBS} |
+| Live hosts       | ${TOTAL_LIVE} |
+| URLs collected   | ${TOTAL_URLS_FINAL} |
+| Vuln findings    | ${TOTAL_VULNS} |
+| Screenshots      | ${TOTAL_SHOTS} |
+
+## Configuration
+- Threads: ${THREADS}
+- Rate limit: ${RATE_LIMIT} req/s
+- Nuclei severity: ${NUCLEI_SEVERITY}
+- Passive only: ${PASSIVE_ONLY}
+
+## Directory Structure
+\`\`\`
+${OUTPUT_DIR}/
+├── subdomains/all.txt        — All unique subdomains (${TOTAL_SUBS})
+├── subdomains/resolved.txt   — DNS-resolved subdomains
+├── hosts/live.txt            — Live HTTP/HTTPS hosts (${TOTAL_LIVE})
+├── hosts/live.json           — httpx JSON output (with tech/title/status)
+├── urls/all.txt              — All collected URLs (${TOTAL_URLS_FINAL})
+├── urls/interesting.txt      — GF-filtered interesting URLs
+├── vulns/nuclei.txt          — Nuclei findings (${TOTAL_VULNS})
+├── vulns/nuclei.json         — Nuclei JSON output
+├── screenshots/              — Gowitness screenshots (${TOTAL_SHOTS})
+└── reports/
+    ├── summary.md            — This report
+    └── technologies.txt      — Technology fingerprint summary
+\`\`\`
+
+## Nuclei Findings
+$(if [[ $TOTAL_VULNS -gt 0 ]]; then cat "${NUCLEI_OUT}" 2>/dev/null; else echo "No findings at selected severity."; fi)
+
+---
+*Generated by bb-recon — Authorized testing only.*
+REPORT
+
+# ─── Done ─────────────────────────────────────────────────────────────────────
+echo ""
+echo -e "${GREEN}${BOLD}╔════════════════════════════════════════════════════════╗${NC}"
+echo -e "${GREEN}${BOLD}║                 RECON COMPLETE ✓                      ║${NC}"
+echo -e "${GREEN}${BOLD}╚════════════════════════════════════════════════════════╝${NC}"
+echo ""
+echo -e "  ${BOLD}Domain:${NC}      ${DOMAIN}"
+echo -e "  ${BOLD}Duration:${NC}    $((SECONDS/60))m $((SECONDS%60))s"
+echo -e "  ${BOLD}Subdomains:${NC}  ${TOTAL_SUBS}"
+echo -e "  ${BOLD}Live hosts:${NC}  ${TOTAL_LIVE}"
+echo -e "  ${BOLD}URLs:${NC}        ${TOTAL_URLS_FINAL}"
+echo -e "  ${BOLD}Findings:${NC}    ${TOTAL_VULNS}"
+echo -e "  ${BOLD}Output:${NC}      ${OUTPUT_DIR}"
+echo ""
+echo -e "${CYAN}  Next steps:${NC}"
+echo -e "    ${BOLD}cat ${OUTPUT_DIR}/reports/summary.md${NC}"
+echo -e "    ${BOLD}cat ${OUTPUT_DIR}/vulns/nuclei.txt${NC}"
+echo -e "    ${BOLD}bb-scan -l ${OUTPUT_DIR}/hosts/live.txt${NC}"
+echo -e "    ${BOLD}bb-idor -l ${OUTPUT_DIR}/urls/interesting.txt${NC}"
+echo ""

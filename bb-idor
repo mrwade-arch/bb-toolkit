@@ -1,0 +1,513 @@
+#!/usr/bin/env bash
+# =============================================================================
+# bb-idor — Automated IDOR (Insecure Direct Object Reference) Tester
+# Version: 1.0.0
+# =============================================================================
+# LEGAL DISCLAIMER:
+#   This tool is intended ONLY for use on targets you have explicit, written
+#   authorization to test. Unauthorized testing is illegal under the Computer
+#   Fraud and Abuse Act (US), the Computer Misuse Act (UK), and equivalent
+#   laws worldwide. IDOR testing can access other users' data — this is
+#   ONLY legal when explicitly authorized in your bug bounty program scope.
+#   The author assumes NO liability for misuse. Test responsibly.
+# =============================================================================
+
+set -euo pipefail
+
+# ─── Colors ───────────────────────────────────────────────────────────────────
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+MAGENTA='\033[0;35m'
+BOLD='\033[1m'
+NC='\033[0m'
+
+# ─── Defaults ─────────────────────────────────────────────────────────────────
+BB_HOME="${BB_HOME:-$HOME/bugbounty}"
+THREADS="${BB_IDOR_THREADS:-10}"
+RATE_LIMIT="${BB_IDOR_RATE:-20}"        # Intentionally conservative
+DELAY="${BB_IDOR_DELAY:-200}"           # ms between requests per thread
+TIMEOUT="${BB_IDOR_TIMEOUT:-10}"
+OUTPUT_DIR="${BB_HOME}/idor"
+TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
+
+TARGET_URL=""
+TARGET_LIST=""
+PARAM_NAME=""
+PARAM_FILE=""
+ID_START=1
+ID_END=100
+ID_LIST=""
+TEST_UUIDS="false"
+AUTH_HEADER=""
+COOKIE=""
+BASELINE_COMPARE="true"   # compare to baseline response
+DIFF_THRESHOLD=50          # % size difference to flag as interesting
+HTTP_METHOD="GET"
+DATA=""
+MATCH_CODES="200"
+FILTER_CODES="404"
+
+WORK_DIR="/tmp/bb-idor-$$"
+BASELINE_FILE=""
+
+# ─── Helpers ──────────────────────────────────────────────────────────────────
+banner() {
+  echo -e "${MAGENTA}"
+  cat <<'EOF'
+  ██████╗ ██████╗       ██╗██████╗  ██████╗ ██████╗
+  ██╔══██╗██╔══██╗      ██║██╔══██╗██╔═══██╗██╔══██╗
+  ██████╔╝██████╔╝█████╗██║██║  ██║██║   ██║██████╔╝
+  ██╔══██╗██╔══██╗╚════╝██║██║  ██║██║   ██║██╔══██╗
+  ██████╔╝██████╔╝      ██║██████╔╝╚██████╔╝██║  ██║
+  ╚═════╝ ╚═════╝       ╚═╝╚═════╝  ╚═════╝ ╚═╝  ╚═╝
+EOF
+  echo -e "${NC}"
+  echo -e "${BOLD}  Automated IDOR Testing Framework | v1.0.0${NC}"
+  echo -e "${RED}  ⚠  Authorized targets only. IDOR testing may access other users' data.${NC}"
+  echo ""
+}
+
+info()    { echo -e "${CYAN}[*]${NC} $*"; }
+success() { echo -e "${GREEN}[✓]${NC} $*"; }
+warn()    { echo -e "${YELLOW}[!]${NC} $*"; }
+error()   { echo -e "${RED}[✗]${NC} $*" >&2; }
+finding() { echo -e "${RED}${BOLD}[IDOR?]${NC} $*"; }
+step()    { echo -e "\n${BLUE}${BOLD}[PHASE]${NC} $*\n${BLUE}$(printf '%.0s─' {1..60})${NC}"; }
+
+usage() {
+  cat <<EOF
+${BOLD}USAGE${NC}
+  bb-idor [OPTIONS] -u URL
+  bb-idor [OPTIONS] -l URL_FILE
+
+${BOLD}TARGET${NC}
+  -u, --url URL       Single target URL (use {ID} placeholder for param)
+                      Example: -u "https://api.example.com/user/{ID}/profile"
+  -l, --list FILE     File of URLs (each may contain {ID} placeholder)
+  -p, --param NAME    Query parameter to fuzz (alternative to {ID} in URL)
+                      Example: -p user_id (fuzzes ?user_id=VALUE)
+
+${BOLD}ID/VALUE OPTIONS${NC}
+  --start N           Start of sequential ID range (default: $ID_START)
+  --end N             End of sequential ID range (default: $ID_END)
+  --ids FILE          File of IDs/values to test (one per line)
+  --uuids             Also test random UUID patterns
+  --method METHOD     HTTP method: GET|POST|PUT|PATCH (default: GET)
+  --data DATA         POST body template (use {ID} placeholder)
+
+${BOLD}AUTH / SESSION${NC}
+  -H, --header HDR    Authorization header (e.g. "Authorization: Bearer TOKEN")
+  -c, --cookie STR    Cookie string (e.g. "session=abc123; user=xyz")
+
+${BOLD}DETECTION OPTIONS${NC}
+  -t, --threads N     Concurrent requests (default: $THREADS)
+  -r, --rate N        Max requests/sec (default: $RATE_LIMIT)
+  --delay N           Delay between requests in ms (default: $DELAY)
+  --timeout N         Request timeout in seconds (default: $TIMEOUT)
+  --diff N            Size diff % to flag as interesting (default: $DIFF_THRESHOLD)
+  --match-codes C     Status codes to capture (default: $MATCH_CODES)
+  --filter-codes C    Status codes to filter out (default: $FILTER_CODES)
+  --no-compare        Skip baseline comparison (flag all matching codes)
+
+${BOLD}OUTPUT${NC}
+  -o, --output DIR    Output directory (default: $OUTPUT_DIR/TIMESTAMP/)
+
+${BOLD}EXAMPLES${NC}
+  # Sequential numeric IDOR on REST API
+  bb-idor -u "https://api.example.com/users/{ID}" \
+          -H "Authorization: Bearer eyJ..." \
+          --start 1 --end 500
+
+  # Parameter-based IDOR with custom ID list
+  bb-idor -u "https://example.com/api/invoice" \
+          -p invoice_id \
+          --ids my_invoice_ids.txt \
+          -c "session=abc123"
+
+  # Test multiple endpoints from recon output
+  bb-idor -l ~/bugbounty/example.com/urls/interesting.txt \
+          -H "Authorization: Bearer TOKEN" \
+          --start 1 --end 200
+
+  # POST-based IDOR
+  bb-idor -u "https://api.example.com/update" \
+          --method POST \
+          --data '{"user_id": "{ID}", "action": "view"}' \
+          -H "Authorization: Bearer TOKEN" \
+          --start 100 --end 200
+
+${RED}${BOLD}LEGAL: IDOR testing may access other users' private data.
+Only test on targets that explicitly permit this in their bug bounty scope.${NC}
+EOF
+  exit 0
+}
+
+# Build curl command with auth
+build_curl_cmd() {
+  local url="$1"
+  local id_val="$2"
+  local final_url
+
+  # Substitute {ID} in URL
+  final_url="${url//\{ID\}/${id_val}}"
+
+  CMD="curl -s -o /dev/null -w '%{http_code}|%{size_download}|%{time_total}|%{url_effective}'"
+  CMD="${CMD} -m ${TIMEOUT}"
+  CMD="${CMD} -L"  # follow redirects
+  CMD="${CMD} -X ${HTTP_METHOD}"
+
+  [[ -n "$AUTH_HEADER" ]] && CMD="${CMD} -H '${AUTH_HEADER}'"
+  [[ -n "$COOKIE" ]]      && CMD="${CMD} -b '${COOKIE}'"
+
+  if [[ "$HTTP_METHOD" != "GET" ]] && [[ -n "$DATA" ]]; then
+    local final_data="${DATA//\{ID\}/${id_val}}"
+    CMD="${CMD} -H 'Content-Type: application/json'"
+    CMD="${CMD} -d '${final_data}'"
+  fi
+
+  CMD="${CMD} '${final_url}'"
+  echo "$CMD"
+}
+
+get_baseline() {
+  local url="$1"
+  local cmd
+  cmd=$(build_curl_cmd "$url" "BASELINE_NONEXISTENT_${RANDOM}")
+  local result
+  result=$(eval "$cmd" 2>/dev/null || echo "000|0|0|unknown")
+  echo "$result"
+}
+
+test_id() {
+  local url="$1"
+  local id_val="$2"
+  local baseline_size="${3:-0}"
+  local out_dir="$4"
+
+  # Rate limiting
+  sleep "0.$(printf '%03d' $DELAY)"
+
+  local final_url="${url//\{ID\}/${id_val}}"
+  local cmd
+  cmd=$(build_curl_cmd "$url" "$id_val")
+
+  local result
+  result=$(eval "$cmd" 2>/dev/null || echo "000|0|0|${final_url}")
+
+  local status_code size_bytes time_taken
+  IFS='|' read -r status_code size_bytes time_taken _ <<< "$result"
+
+  # Check if this status code is in our match list
+  if echo "$MATCH_CODES" | grep -q "$status_code"; then
+    if echo "$FILTER_CODES" | grep -q "$status_code"; then
+      return 0
+    fi
+
+    local interesting="false"
+
+    if [[ "$BASELINE_COMPARE" == "true" ]] && [[ $baseline_size -gt 0 ]]; then
+      # Calculate size difference percentage
+      local diff_pct=0
+      if [[ $size_bytes -gt $baseline_size ]]; then
+        diff_pct=$(( (size_bytes - baseline_size) * 100 / baseline_size ))
+      fi
+      [[ $diff_pct -ge $DIFF_THRESHOLD ]] && interesting="true"
+    else
+      interesting="true"
+    fi
+
+    local log_line="${status_code}|${size_bytes}|${time_taken}|${final_url}|interesting=${interesting}"
+
+    # Log all matching responses
+    echo "$log_line" >> "${out_dir}/all_responses.txt"
+
+    if [[ "$interesting" == "true" ]]; then
+      finding "ID=${id_val} | Status=${status_code} | Size=${size_bytes}B | ${final_url}"
+      echo "$log_line" >> "${out_dir}/interesting.txt"
+
+      # Save full response body for interesting hits
+      local body_file="${out_dir}/bodies/id_${id_val}.json"
+      mkdir -p "${out_dir}/bodies"
+      local body_cmd
+      body_cmd=$(build_curl_cmd "$url" "$id_val")
+      body_cmd="${body_cmd//-o \/dev\/null/-o '${body_file}'}"
+      eval "$body_cmd" 2>/dev/null || true
+    fi
+  fi
+}
+
+generate_uuids() {
+  local count="${1:-20}"
+  for ((i=0; i<count; i++)); do
+    printf '%08x-%04x-4%03x-%04x-%012x\n' \
+      $RANDOM $RANDOM $RANDOM \
+      $(( (RANDOM & 0x3FFF) | 0x8000 )) \
+      $(( RANDOM * RANDOM ))
+  done
+}
+
+# ─── Argument Parsing ─────────────────────────────────────────────────────────
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -h|--help)         usage ;;
+    -u|--url)          TARGET_URL="$2"; shift 2 ;;
+    -l|--list)         TARGET_LIST="$2"; shift 2 ;;
+    -p|--param)        PARAM_NAME="$2"; shift 2 ;;
+    --start)           ID_START="$2"; shift 2 ;;
+    --end)             ID_END="$2"; shift 2 ;;
+    --ids)             ID_LIST="$2"; shift 2 ;;
+    --uuids)           TEST_UUIDS="true"; shift ;;
+    --method)          HTTP_METHOD="${2^^}"; shift 2 ;;
+    --data)            DATA="$2"; shift 2 ;;
+    -H|--header)       AUTH_HEADER="$2"; shift 2 ;;
+    -c|--cookie)       COOKIE="$2"; shift 2 ;;
+    -t|--threads)      THREADS="$2"; shift 2 ;;
+    -r|--rate)         RATE_LIMIT="$2"; shift 2 ;;
+    --delay)           DELAY="$2"; shift 2 ;;
+    --timeout)         TIMEOUT="$2"; shift 2 ;;
+    --diff)            DIFF_THRESHOLD="$2"; shift 2 ;;
+    --match-codes)     MATCH_CODES="$2"; shift 2 ;;
+    --filter-codes)    FILTER_CODES="$2"; shift 2 ;;
+    --no-compare)      BASELINE_COMPARE="false"; shift ;;
+    -o|--output)       OUTPUT_DIR="$2"; shift 2 ;;
+    *)                 error "Unknown option: $1"; usage ;;
+  esac
+done
+
+# ─── Pre-flight ───────────────────────────────────────────────────────────────
+banner
+
+if [[ -z "$TARGET_URL" ]] && [[ -z "$TARGET_LIST" ]]; then
+  error "No target specified. Use -u URL or -l FILE."
+  usage
+fi
+
+mkdir -p "$WORK_DIR"
+trap 'rm -rf "$WORK_DIR"' EXIT
+
+IDOR_OUT="${OUTPUT_DIR}/${TIMESTAMP}"
+mkdir -p "${IDOR_OUT}"/{interesting,bodies}
+
+LOG_FILE="${IDOR_OUT}/idor_${TIMESTAMP}.log"
+exec > >(tee -a "$LOG_FILE") 2>&1
+
+echo -e "${RED}${BOLD}"
+echo "  ╔═══════════════════════════════════════════════════╗"
+echo "  ║      ⚠  IDOR LEGAL WARNING  ⚠                   ║"
+echo "  ║  IDOR testing may access other users' private     ║"
+echo "  ║  data. Only test with explicit written            ║"
+echo "  ║  authorization that covers IDOR testing.          ║"
+echo "  ║  Unauthorized access to others' data is a        ║"
+echo "  ║  serious criminal offense.                        ║"
+echo "  ╚═══════════════════════════════════════════════════╝"
+echo -e "${NC}"
+
+# Build URL list
+URL_FILE="${WORK_DIR}/urls.txt"
+if [[ -n "$TARGET_URL" ]]; then
+  # Inject {ID} placeholder if param name given
+  if [[ -n "$PARAM_NAME" ]] && [[ "$TARGET_URL" != *"{ID}"* ]]; then
+    if [[ "$TARGET_URL" == *"?"* ]]; then
+      echo "${TARGET_URL}&${PARAM_NAME}={ID}" > "$URL_FILE"
+    else
+      echo "${TARGET_URL}?${PARAM_NAME}={ID}" > "$URL_FILE"
+    fi
+  else
+    echo "$TARGET_URL" > "$URL_FILE"
+  fi
+else
+  cp "$TARGET_LIST" "$URL_FILE"
+fi
+
+URL_COUNT=$(wc -l < "$URL_FILE")
+
+# Build ID list
+ID_FILE="${WORK_DIR}/ids.txt"
+
+if [[ -n "$ID_LIST" ]] && [[ -f "$ID_LIST" ]]; then
+  cp "$ID_LIST" "$ID_FILE"
+else
+  seq "$ID_START" "$ID_END" > "$ID_FILE"
+fi
+
+if [[ "$TEST_UUIDS" == "true" ]]; then
+  generate_uuids 30 >> "$ID_FILE"
+fi
+
+ID_COUNT=$(wc -l < "$ID_FILE")
+TOTAL_REQUESTS=$(( URL_COUNT * ID_COUNT ))
+
+info "URLs to test:        ${URL_COUNT}"
+info "IDs to test:         ${ID_COUNT}"
+info "Total requests:      ${TOTAL_REQUESTS}"
+info "Threads:             ${THREADS}"
+info "Rate limit:          ${RATE_LIMIT} req/s"
+info "Delay:               ${DELAY}ms"
+info "Baseline compare:    ${BASELINE_COMPARE}"
+info "Diff threshold:      ${DIFF_THRESHOLD}%"
+info "Output:              ${IDOR_OUT}"
+
+echo ""
+warn "Estimated time: ~$(( TOTAL_REQUESTS / RATE_LIMIT / 60 + 1 )) minute(s) at ${RATE_LIMIT} req/s"
+echo ""
+
+read -r -p "$(echo -e "${YELLOW}Proceed? (yes/no): ${NC}")" CONFIRM
+[[ "${CONFIRM,,}" != "yes" ]] && { info "Aborted."; exit 0; }
+echo ""
+
+# ─── Main IDOR Test Loop ──────────────────────────────────────────────────────
+step "TESTING — IDOR Enumeration"
+
+INTERESTING_TOTAL=0
+REQUEST_COUNT=0
+
+while IFS= read -r url || [[ -n "$url" ]]; do
+  [[ -z "$url" || "$url" =~ ^# ]] && continue
+
+  # Ensure URL has {ID} placeholder
+  if [[ "$url" != *"{ID}"* ]]; then
+    warn "URL has no {ID} placeholder — skipping: ${url}"
+    continue
+  fi
+
+  info "Testing: ${url}"
+  URL_OUT="${IDOR_OUT}/$(echo "$url" | sed 's|https\?://||;s|[^a-zA-Z0-9_-]|_|g' | cut -c1-80)"
+  mkdir -p "${URL_OUT}/bodies"
+  touch "${URL_OUT}/all_responses.txt" "${URL_OUT}/interesting.txt"
+
+  # Get baseline response (with nonexistent ID)
+  BASELINE_SIZE=0
+  if [[ "$BASELINE_COMPARE" == "true" ]]; then
+    info "  Getting baseline response..."
+    BASELINE_RESULT=$(build_curl_cmd "$url" "999999999" | bash 2>/dev/null || echo "000|0|0|x")
+    BASELINE_STATUS=$(echo "$BASELINE_RESULT" | cut -d'|' -f1)
+    BASELINE_SIZE=$(echo "$BASELINE_RESULT" | cut -d'|' -f2)
+    info "  Baseline: HTTP ${BASELINE_STATUS}, ${BASELINE_SIZE} bytes"
+  fi
+
+  # Export vars for use in subshell via parallel/xargs
+  export url BASELINE_SIZE AUTH_HEADER COOKIE HTTP_METHOD DATA
+  export TIMEOUT DELAY DIFF_THRESHOLD BASELINE_COMPARE
+  export MATCH_CODES FILTER_CODES
+
+  # Use GNU parallel if available, otherwise xargs
+  if command -v parallel &>/dev/null; then
+    cat "$ID_FILE" | parallel \
+      --jobs "$THREADS" \
+      --delay "$(echo "scale=3; $DELAY/1000" | bc 2>/dev/null || echo 0.2)" \
+      --no-notice \
+      "$(declare -f test_id finding); test_id '${url}' {} ${BASELINE_SIZE} '${URL_OUT}'" \
+      2>/dev/null || true
+  else
+    while IFS= read -r id_val; do
+      test_id "$url" "$id_val" "$BASELINE_SIZE" "${URL_OUT}"
+      REQUEST_COUNT=$((REQUEST_COUNT + 1))
+    done < "$ID_FILE"
+  fi
+
+  URL_INTERESTING=$(wc -l < "${URL_OUT}/interesting.txt" 2>/dev/null || echo 0)
+  INTERESTING_TOTAL=$((INTERESTING_TOTAL + URL_INTERESTING))
+
+  if [[ $URL_INTERESTING -gt 0 ]]; then
+    finding "${BOLD}${URL_INTERESTING} interesting responses for: ${url}${NC}"
+    # Copy interesting findings to main output
+    cp "${URL_OUT}/interesting.txt" "${IDOR_OUT}/interesting/${TIMESTAMP}_$(basename "$URL_OUT").txt" 2>/dev/null || true
+  fi
+
+  echo ""
+
+done < "$URL_FILE"
+
+# ─── Response Analysis ────────────────────────────────────────────────────────
+step "ANALYSIS — Response Diffing"
+
+if [[ $INTERESTING_TOTAL -gt 0 ]]; then
+  echo ""
+  echo -e "${YELLOW}═══ Interesting Responses Summary ══════════════════════${NC}"
+  find "${IDOR_OUT}/interesting" -name "*.txt" -exec cat {} \; 2>/dev/null | sort -u | \
+    while IFS='|' read -r code size time furl iflg; do
+      echo -e "  ${RED}${code}${NC} | ${BOLD}${size}B${NC} | ${furl}"
+    done
+  echo ""
+
+  # Look for responses that contain sensitive field patterns
+  info "Scanning response bodies for sensitive data patterns..."
+  SENSITIVE_PATTERNS=(
+    '"email"'
+    '"password"'
+    '"ssn"'
+    '"social_security"'
+    '"credit_card"'
+    '"card_number"'
+    '"phone"'
+    '"address"'
+    '"dob"'
+    '"date_of_birth"'
+    '"api_key"'
+    '"secret"'
+    '"token"'
+    '"private_key"'
+  )
+
+  SENSITIVE_COUNT=0
+  for pattern in "${SENSITIVE_PATTERNS[@]}"; do
+    MATCHES=$(grep -rl "$pattern" "${IDOR_OUT}" --include="*.json" 2>/dev/null | wc -l)
+    if [[ $MATCHES -gt 0 ]]; then
+      finding "Sensitive field '${pattern}' found in ${MATCHES} response body/bodies"
+      SENSITIVE_COUNT=$((SENSITIVE_COUNT + MATCHES))
+    fi
+  done
+
+  [[ $SENSITIVE_COUNT -eq 0 ]] && info "No obvious sensitive data patterns detected in response bodies"
+fi
+
+# ─── Final Report ─────────────────────────────────────────────────────────────
+REPORT="${IDOR_OUT}/idor_report_${TIMESTAMP}.md"
+cat > "$REPORT" <<REPORT_EOF
+# IDOR Test Report
+**Date:** $(date)
+**Duration:** $((SECONDS/60))m $((SECONDS%60))s
+
+## Scope
+- URLs tested: ${URL_COUNT}
+- IDs/values tested per URL: ${ID_COUNT}
+- Total requests made: ${REQUEST_COUNT}
+- Threads: ${THREADS}
+- Rate limit: ${RATE_LIMIT} req/s
+
+## Results
+- **Interesting responses (potential IDOR):** ${INTERESTING_TOTAL}
+- Response size diff threshold: ${DIFF_THRESHOLD}%
+- Baseline comparison: ${BASELINE_COMPARE}
+
+## Interesting Findings
+$(find "${IDOR_OUT}/interesting" -name "*.txt" -exec cat {} \; 2>/dev/null | sort -u | head -100 || echo "None")
+
+## Files
+- All responses: \`${IDOR_OUT}/*/all_responses.txt\`
+- Interesting: \`${IDOR_OUT}/interesting/\`
+- Response bodies: \`${IDOR_OUT}/*/bodies/\`
+
+---
+*⚠ Only report verified IDOR issues with proof of impact.*
+*Never exfiltrate real user data as part of your PoC.*
+REPORT_EOF
+
+echo ""
+echo -e "${GREEN}${BOLD}╔════════════════════════════════════════════════════════╗${NC}"
+echo -e "${GREEN}${BOLD}║               IDOR TEST COMPLETE ✓                    ║${NC}"
+echo -e "${GREEN}${BOLD}╚════════════════════════════════════════════════════════╝${NC}"
+echo ""
+echo -e "  ${BOLD}Requests made:${NC}       ${REQUEST_COUNT}"
+echo -e "  ${BOLD}Interesting hits:${NC}    ${INTERESTING_TOTAL}"
+echo -e "  ${BOLD}Duration:${NC}            $((SECONDS/60))m $((SECONDS%60))s"
+echo -e "  ${BOLD}Report:${NC}              ${REPORT}"
+echo -e "  ${BOLD}Output:${NC}              ${IDOR_OUT}"
+echo ""
+echo -e "${YELLOW}  IMPORTANT: Verify each finding manually before reporting.${NC}"
+echo -e "${YELLOW}  Never access more data than needed to prove the vulnerability.${NC}"
+echo -e "${YELLOW}  Do not store, share, or use any real user data found.${NC}"
+echo ""

@@ -1,0 +1,412 @@
+#!/usr/bin/env bash
+# =============================================================================
+# bb-scan — Multithreaded Bug Bounty Vulnerability Scanner
+# Version: 1.0.0
+# =============================================================================
+# LEGAL DISCLAIMER:
+#   This tool is intended ONLY for use on targets you have explicit, written
+#   authorization to test. Unauthorized scanning is illegal under the Computer
+#   Fraud and Abuse Act (US), the Computer Misuse Act (UK), and equivalent
+#   laws worldwide. The author assumes NO liability for misuse.
+#   Always verify scope. Always test responsibly.
+# =============================================================================
+
+set -euo pipefail
+
+# ─── Colors ───────────────────────────────────────────────────────────────────
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+MAGENTA='\033[0;35m'
+BOLD='\033[1m'
+NC='\033[0m'
+
+# ─── Defaults ─────────────────────────────────────────────────────────────────
+BB_HOME="${BB_HOME:-$HOME/bugbounty}"
+THREADS="${BB_SCAN_THREADS:-25}"
+RATE_LIMIT="${BB_SCAN_RATE:-50}"
+TIMEOUT="${BB_SCAN_TIMEOUT:-10}"
+RETRIES="${BB_SCAN_RETRIES:-2}"
+SEVERITY="${BB_SCAN_SEVERITY:-critical,high,medium}"
+TEMPLATES="${BB_TEMPLATES:-}"
+SCOPE_FILE=""
+TARGET_URL=""
+TARGET_LIST=""
+OUTPUT_DIR="${BB_HOME}/scans"
+SCAN_MODE="full"           # full | passive | fuzz
+JSON_OUTPUT="true"
+CUSTOM_TEMPLATES_DIR="$HOME/.bugbounty/nuclei-templates"
+TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
+
+# ─── Helpers ──────────────────────────────────────────────────────────────────
+banner() {
+  echo -e "${CYAN}"
+  cat <<'EOF'
+  ██████╗ ██████╗       ███████╗ ██████╗ █████╗ ███╗   ██╗
+  ██╔══██╗██╔══██╗      ██╔════╝██╔════╝██╔══██╗████╗  ██║
+  ██████╔╝██████╔╝█████╗███████╗██║     ███████║██╔██╗ ██║
+  ██╔══██╗██╔══██╗╚════╝╚════██║██║     ██╔══██║██║╚██╗██║
+  ██████╔╝██████╔╝      ███████║╚██████╗██║  ██║██║ ╚████║
+  ╚═════╝ ╚═════╝       ╚══════╝ ╚═════╝╚═╝  ╚═╝╚═╝  ╚═══╝
+EOF
+  echo -e "${NC}"
+  echo -e "${BOLD}  Multithreaded Vulnerability Scanner | v1.0.0${NC}"
+  echo -e "${RED}  ⚠  Authorized targets only. Test responsibly.${NC}"
+  echo ""
+}
+
+info()    { echo -e "${CYAN}[*]${NC} $*"; }
+success() { echo -e "${GREEN}[✓]${NC} $*"; }
+warn()    { echo -e "${YELLOW}[!]${NC} $*"; }
+error()   { echo -e "${RED}[✗]${NC} $*" >&2; }
+step()    { echo -e "\n${BLUE}${BOLD}[SCAN]${NC} $*"; echo -e "${BLUE}$(printf '%.0s─' {1..60})${NC}"; }
+finding() { echo -e "${RED}${BOLD}[FINDING]${NC} $*"; }
+
+usage() {
+  cat <<EOF
+${BOLD}USAGE${NC}
+  bb-scan [OPTIONS] (-u URL | -l FILE)
+
+${BOLD}TARGET OPTIONS${NC}
+  -u, --url URL      Single target URL
+  -l, --list FILE    File containing target URLs (one per line)
+  --scope FILE       Scope file (URLs/domains; out-of-scope are skipped)
+
+${BOLD}SCAN OPTIONS${NC}
+  -m, --mode MODE    Scan mode: full | passive | fuzz (default: full)
+  -s, --severity S   Nuclei severity: critical,high,medium,low,info
+                     (default: $SEVERITY)
+  -t, --threads N    Concurrent nuclei templates (default: $THREADS)
+  -r, --rate N       Requests per second (default: $RATE_LIMIT)
+  --timeout N        Request timeout in seconds (default: $TIMEOUT)
+  --retries N        Number of retries (default: $RETRIES)
+  --templates DIR    Custom nuclei templates directory
+  --tags TAGS        Run templates matching tags (e.g. cve,rce,xss)
+  --exclude-tags T   Exclude templates matching these tags
+
+${BOLD}OUTPUT OPTIONS${NC}
+  -o, --output DIR   Output directory (default: $OUTPUT_DIR/TIMESTAMP/)
+  --no-json          Disable JSON output (plaintext only)
+
+${BOLD}SCAN MODES${NC}
+  full     Full scan: nuclei + nmap + dalfox XSS + SQLMap (careful!)
+  passive  Nuclei passive templates only (safe for any target)
+  fuzz     Nuclei + dalfox XSS + FFUF fuzzing
+
+${BOLD}EXAMPLES${NC}
+  bb-scan -u https://example.com
+  bb-scan -l ~/bugbounty/example.com/hosts/live.txt
+  bb-scan -l hosts.txt -m passive -s critical,high
+  bb-scan -l hosts.txt --tags cve --severity critical
+  bb-scan -l hosts.txt --scope ~/bugbounty/example.com/scope.txt
+
+${RED}${BOLD}LEGAL: Only run against targets you are authorized to test.${NC}
+EOF
+  exit 0
+}
+
+check_tool() {
+  command -v "$1" &>/dev/null
+}
+
+require_tool() {
+  if ! command -v "$1" &>/dev/null; then
+    error "Required tool '$1' not found. Run: install.sh"
+    exit 1
+  fi
+}
+
+in_scope() {
+  local target="$1"
+  if [[ -z "$SCOPE_FILE" ]] || [[ ! -f "$SCOPE_FILE" ]]; then
+    return 0  # no scope file = all in scope
+  fi
+  while IFS= read -r scope_entry || [[ -n "$scope_entry" ]]; do
+    [[ "$scope_entry" =~ ^#|^$ ]] && continue
+    if [[ "$target" == *"$scope_entry"* ]]; then
+      return 0
+    fi
+  done < "$SCOPE_FILE"
+  return 1
+}
+
+# ─── Argument Parsing ─────────────────────────────────────────────────────────
+EXTRA_NUCLEI_ARGS=""
+TAGS=""
+EXCLUDE_TAGS=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -h|--help)         usage ;;
+    -u|--url)          TARGET_URL="$2"; shift 2 ;;
+    -l|--list)         TARGET_LIST="$2"; shift 2 ;;
+    --scope)           SCOPE_FILE="$2"; shift 2 ;;
+    -m|--mode)         SCAN_MODE="$2"; shift 2 ;;
+    -s|--severity)     SEVERITY="$2"; shift 2 ;;
+    -t|--threads)      THREADS="$2"; shift 2 ;;
+    -r|--rate)         RATE_LIMIT="$2"; shift 2 ;;
+    --timeout)         TIMEOUT="$2"; shift 2 ;;
+    --retries)         RETRIES="$2"; shift 2 ;;
+    --templates)       TEMPLATES="$2"; shift 2 ;;
+    --tags)            TAGS="$2"; shift 2 ;;
+    --exclude-tags)    EXCLUDE_TAGS="$2"; shift 2 ;;
+    -o|--output)       OUTPUT_DIR="$2"; shift 2 ;;
+    --no-json)         JSON_OUTPUT="false"; shift ;;
+    *)                 error "Unknown option: $1"; usage ;;
+  esac
+done
+
+# ─── Pre-flight ───────────────────────────────────────────────────────────────
+banner
+
+if [[ -z "$TARGET_URL" ]] && [[ -z "$TARGET_LIST" ]]; then
+  error "No target specified. Use -u URL or -l FILE."
+  usage
+fi
+
+require_tool nuclei
+
+# Build target list file
+WORK_DIR="/tmp/bb-scan-$$"
+mkdir -p "$WORK_DIR"
+trap 'rm -rf "$WORK_DIR"' EXIT
+
+TARGETS_FILE="${WORK_DIR}/targets.txt"
+
+if [[ -n "$TARGET_URL" ]]; then
+  echo "$TARGET_URL" > "$TARGETS_FILE"
+elif [[ -n "$TARGET_LIST" ]]; then
+  if [[ ! -f "$TARGET_LIST" ]]; then
+    error "Target list not found: $TARGET_LIST"
+    exit 1
+  fi
+  # Apply scope filter if provided
+  if [[ -n "$SCOPE_FILE" ]]; then
+    info "Applying scope filter from: $SCOPE_FILE"
+    FILTERED=0
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      [[ -z "$line" || "$line" =~ ^# ]] && continue
+      if in_scope "$line"; then
+        echo "$line" >> "$TARGETS_FILE"
+      else
+        FILTERED=$((FILTERED + 1))
+      fi
+    done < "$TARGET_LIST"
+    warn "Filtered out ${FILTERED} out-of-scope targets"
+  else
+    cp "$TARGET_LIST" "$TARGETS_FILE"
+  fi
+fi
+
+TARGET_COUNT=$(wc -l < "$TARGETS_FILE")
+if [[ $TARGET_COUNT -eq 0 ]]; then
+  error "No targets remaining after scope filtering."
+  exit 1
+fi
+
+# Set up output directory
+SCAN_DIR="${OUTPUT_DIR}/${TIMESTAMP}"
+mkdir -p "${SCAN_DIR}"/{nuclei,nmap,xss,fuzz,raw}
+
+LOG_FILE="${SCAN_DIR}/scan_${TIMESTAMP}.log"
+exec > >(tee -a "$LOG_FILE") 2>&1
+
+echo -e "${RED}${BOLD}"
+echo "  ╔═══════════════════════════════════════════════════╗"
+echo "  ║            ⚠  LEGAL WARNING  ⚠                  ║"
+echo "  ║  Only run against targets you are authorized      ║"
+echo "  ║  to test. Unauthorized scanning is illegal.       ║"
+echo "  ╚═══════════════════════════════════════════════════╝"
+echo -e "${NC}"
+
+info "Targets:    ${TARGET_COUNT}"
+info "Mode:       ${SCAN_MODE}"
+info "Severity:   ${SEVERITY}"
+info "Threads:    ${THREADS}"
+info "Rate:       ${RATE_LIMIT} req/s"
+info "Output:     ${SCAN_DIR}"
+info "Started:    $(date)"
+
+# ─── Build Nuclei Arguments ───────────────────────────────────────────────────
+NUCLEI_CMD="nuclei -l ${TARGETS_FILE}"
+NUCLEI_CMD="${NUCLEI_CMD} -severity ${SEVERITY}"
+NUCLEI_CMD="${NUCLEI_CMD} -c ${THREADS}"
+NUCLEI_CMD="${NUCLEI_CMD} -rl ${RATE_LIMIT}"
+NUCLEI_CMD="${NUCLEI_CMD} -timeout ${TIMEOUT}"
+NUCLEI_CMD="${NUCLEI_CMD} -retries ${RETRIES}"
+NUCLEI_CMD="${NUCLEI_CMD} -silent"
+NUCLEI_CMD="${NUCLEI_CMD} -o ${SCAN_DIR}/nuclei/findings.txt"
+
+[[ "$JSON_OUTPUT" == "true" ]] && NUCLEI_CMD="${NUCLEI_CMD} -jsonl -output ${SCAN_DIR}/nuclei/findings.json"
+[[ -n "$TEMPLATES" ]] && NUCLEI_CMD="${NUCLEI_CMD} -t ${TEMPLATES}"
+[[ -n "$CUSTOM_TEMPLATES_DIR" ]] && [[ -d "$CUSTOM_TEMPLATES_DIR" ]] && \
+  NUCLEI_CMD="${NUCLEI_CMD} -t ${CUSTOM_TEMPLATES_DIR}"
+[[ -n "$TAGS" ]] && NUCLEI_CMD="${NUCLEI_CMD} -tags ${TAGS}"
+[[ -n "$EXCLUDE_TAGS" ]] && NUCLEI_CMD="${NUCLEI_CMD} -etags ${EXCLUDE_TAGS}"
+
+# Mode-specific flags
+case "$SCAN_MODE" in
+  passive)
+    NUCLEI_CMD="${NUCLEI_CMD} -passive"
+    ;;
+  full)
+    # No extra flags — full scan
+    ;;
+  fuzz)
+    NUCLEI_CMD="${NUCLEI_CMD} -fuzz"
+    ;;
+esac
+
+# ─── PHASE 1: Nuclei Scan ─────────────────────────────────────────────────────
+step "PHASE 1 — Nuclei Template Scan"
+
+info "Updating nuclei templates..."
+nuclei -update-templates -silent 2>/dev/null || warn "Template update failed (continuing)"
+
+info "Launching nuclei (severity: ${SEVERITY}, mode: ${SCAN_MODE})..."
+eval "$NUCLEI_CMD" 2>/dev/null || warn "Nuclei completed with warnings"
+
+NUCLEI_FINDINGS=$(wc -l < "${SCAN_DIR}/nuclei/findings.txt" 2>/dev/null || echo 0)
+
+if [[ $NUCLEI_FINDINGS -gt 0 ]]; then
+  finding "Nuclei found ${BOLD}${NUCLEI_FINDINGS}${NC} issue(s)!"
+  echo ""
+  echo -e "${YELLOW}─── Severity Breakdown ──────────────────────────────${NC}"
+  grep -oiP '(?<=\[)(critical|high|medium|low|info)(?=\])' \
+    "${SCAN_DIR}/nuclei/findings.txt" 2>/dev/null \
+    | sort | uniq -c | sort -rn \
+    | while read -r count sev; do
+        case "${sev,,}" in
+          critical) echo -e "  ${RED}${BOLD}CRITICAL:${NC} ${count}" ;;
+          high)     echo -e "  ${RED}HIGH:${NC}     ${count}" ;;
+          medium)   echo -e "  ${YELLOW}MEDIUM:${NC}   ${count}" ;;
+          low)      echo -e "  ${CYAN}LOW:${NC}      ${count}" ;;
+          info)     echo -e "  ${NC}INFO:${NC}     ${count}" ;;
+        esac
+      done
+  echo ""
+  echo -e "${YELLOW}─── Top Findings ────────────────────────────────────${NC}"
+  head -20 "${SCAN_DIR}/nuclei/findings.txt"
+else
+  success "Nuclei: No findings at severity [${SEVERITY}]"
+fi
+
+# ─── PHASE 2: XSS Scanning (full/fuzz mode only) ──────────────────────────────
+if [[ "$SCAN_MODE" != "passive" ]] && check_tool dalfox; then
+  step "PHASE 2 — XSS Scanning (dalfox)"
+
+  info "Scanning for XSS with dalfox..."
+  XSS_OUT="${SCAN_DIR}/xss/dalfox.txt"
+
+  # Only scan URLs with parameters
+  grep -E '\?.*=' "${TARGETS_FILE}" > "${WORK_DIR}/params.txt" 2>/dev/null || true
+  PARAM_COUNT=$(wc -l < "${WORK_DIR}/params.txt" 2>/dev/null || echo 0)
+
+  if [[ $PARAM_COUNT -gt 0 ]]; then
+    info "Found ${PARAM_COUNT} parameterized URLs for XSS testing"
+    dalfox file "${WORK_DIR}/params.txt" \
+      --silence \
+      --no-color \
+      --worker "${THREADS}" \
+      --timeout "${TIMEOUT}" \
+      --delay 100 \
+      --output "$XSS_OUT" 2>/dev/null || true
+
+    XSS_FINDINGS=$(grep -c "VULN\|POC" "$XSS_OUT" 2>/dev/null || echo 0)
+    [[ $XSS_FINDINGS -gt 0 ]] && finding "dalfox found ${XSS_FINDINGS} XSS vector(s)!" \
+      || success "dalfox: No XSS found"
+  else
+    warn "No parameterized URLs found for XSS testing"
+  fi
+else
+  [[ "$SCAN_MODE" != "passive" ]] && warn "dalfox not found — skipping XSS phase"
+fi
+
+# ─── PHASE 3: Port Scan (full mode only) ─────────────────────────────────────
+if [[ "$SCAN_MODE" == "full" ]] && check_tool nmap; then
+  step "PHASE 3 — Port Scanning (nmap)"
+
+  # Extract unique hosts from target list
+  sed -E 's|https?://||;s|/.*||;s|:.*||' "${TARGETS_FILE}" \
+    | sort -u > "${WORK_DIR}/hosts_only.txt"
+
+  HOST_COUNT=$(wc -l < "${WORK_DIR}/hosts_only.txt")
+  info "Port scanning ${HOST_COUNT} host(s)..."
+
+  nmap -iL "${WORK_DIR}/hosts_only.txt" \
+    -T4 \
+    --open \
+    -p "21,22,23,25,53,80,110,143,443,445,1433,1521,3000,3306,3389,5432,5900,6379,8080,8443,8888,9200,27017" \
+    -sV \
+    --version-intensity 3 \
+    -oN "${SCAN_DIR}/nmap/scan.txt" \
+    -oX "${SCAN_DIR}/nmap/scan.xml" \
+    2>/dev/null || warn "nmap scan completed with warnings"
+
+  OPEN_PORTS=$(grep "open" "${SCAN_DIR}/nmap/scan.txt" 2>/dev/null | grep -v "^#" | wc -l || echo 0)
+  success "Open ports found: ${OPEN_PORTS}"
+
+  if [[ $OPEN_PORTS -gt 0 ]]; then
+    echo ""
+    grep "open" "${SCAN_DIR}/nmap/scan.txt" 2>/dev/null | grep -v "^#" | head -20
+  fi
+else
+  [[ "$SCAN_MODE" == "full" ]] && warn "nmap not found — skipping port scan"
+fi
+
+# ─── PHASE 4: Directory Fuzzing (fuzz mode only) ──────────────────────────────
+if [[ "$SCAN_MODE" == "fuzz" ]] && check_tool ffuf; then
+  step "PHASE 4 — Directory Fuzzing (ffuf)"
+
+  WORDLIST=""
+  for wl in \
+    "$HOME/wordlists/SecLists/Discovery/Web-Content/common.txt" \
+    "$HOME/wordlists/SecLists/Discovery/Web-Content/raft-medium-files.txt" \
+    "/usr/share/wordlists/dirb/common.txt"; do
+    [[ -f "$wl" ]] && { WORDLIST="$wl"; break; }
+  done
+
+  if [[ -n "$WORDLIST" ]]; then
+    WORD_COUNT=$(wc -l < "$WORDLIST")
+    info "Fuzzing with ${WORD_COUNT} words from $(basename "$WORDLIST")..."
+
+    # Fuzz top 10 targets to avoid flooding
+    head -10 "${TARGETS_FILE}" | while IFS= read -r target; do
+      TARGET_SAFE=$(echo "$target" | sed 's|https\?://||;s|/|_|g')
+      ffuf \
+        -u "${target}/FUZZ" \
+        -w "${WORDLIST}" \
+        -t "$THREADS" \
+        -rate "$RATE_LIMIT" \
+        -timeout "$TIMEOUT" \
+        -mc 200,201,204,301,302,307,401,403 \
+        -o "${SCAN_DIR}/fuzz/${TARGET_SAFE}.json" \
+        -of json \
+        -s \
+        2>/dev/null || true
+    done
+    success "Directory fuzzing complete — results in ${SCAN_DIR}/fuzz/"
+  else
+    warn "No wordlist found for ffuf — run install.sh to download SecLists"
+  fi
+fi
+
+# ─── Final Summary ────────────────────────────────────────────────────────────
+TOTAL_NUCLEI=$(wc -l < "${SCAN_DIR}/nuclei/findings.txt" 2>/dev/null || echo 0)
+TOTAL_XSS=$(grep -c "VULN\|POC" "${SCAN_DIR}/xss/dalfox.txt" 2>/dev/null || echo 0)
+TOTAL_PORTS=$(grep -c "open" "${SCAN_DIR}/nmap/scan.txt" 2>/dev/null || echo 0)
+
+echo ""
+echo -e "${GREEN}${BOLD}╔════════════════════════════════════════════════════════╗${NC}"
+echo -e "${GREEN}${BOLD}║                  SCAN COMPLETE ✓                      ║${NC}"
+echo -e "${GREEN}${BOLD}╚════════════════════════════════════════════════════════╝${NC}"
+echo ""
+echo -e "  ${BOLD}Targets scanned:${NC}   ${TARGET_COUNT}"
+echo -e "  ${BOLD}Duration:${NC}          $((SECONDS/60))m $((SECONDS%60))s"
+echo -e "  ${BOLD}Nuclei findings:${NC}   ${TOTAL_NUCLEI}"
+echo -e "  ${BOLD}XSS vectors:${NC}       ${TOTAL_XSS}"
+echo -e "  ${BOLD}Open ports:${NC}        ${TOTAL_PORTS}"
+echo -e "  ${BOLD}Output:${NC}            ${SCAN_DIR}"
+echo ""
