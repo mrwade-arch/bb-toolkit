@@ -10,13 +10,13 @@
 ## One-Line Install
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/YOUR_USER/bb-toolkit/main/install.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/mrwade-arch/bb-toolkit/main/install.sh)
 ```
 
 Or clone and run locally:
 
 ```bash
-git clone https://github.com/YOUR_USER/bb-toolkit.git
+git clone https://github.com/mrwade-arch/bb-toolkit.git
 cd bb-toolkit
 chmod +x install.sh
 ./install.sh
